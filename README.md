@@ -85,3 +85,7 @@ python ./Fwhandler.py -f ./S34ML01G200TFI00@TSOP48_5332.BIN -e 8 -s 64 -u 2048 -
 - Try to add some commonly used ECC algorithms.
 - Solve the problem that -- tmp parameter and -- noskipbad parameter cannot exist at the same time
 - Adapt more firmware. Welcome to provide more firmware.
+
+
+# Revision history
+v0.10 alpha: First decent public release.
