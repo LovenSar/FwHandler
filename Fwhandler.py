@@ -1,229 +1,610 @@
-import sys
-import os
-import getopt
+"""Raw NAND firmware layout handling.
 
-ecclen = 0              # bytes
-spare = 0              # bytes
-unit = 0             # bytes
-page = unit + spare     # bytes
-block = 0              # pages
-plane = 0            # blocks
+The profile path is intentionally limited to physical page parsing. It removes
+the complete OOB area and does not guess an ECC byte layout that belongs to a
+particular NAND controller or programmer.
+"""
+
+from __future__ import print_function
+
+import argparse
+import os
+import sys
+from dataclasses import dataclass, replace
+
+
+LOGO = r"""       ___                               _ _
+      / __\_      __/\  /\__ _ _ __   __| | | ___ _ __
+      / _\ \ \ /\ / / /_/ / _` | '_ \ / _` | |/ _ \ '__|
+     / /    \ V  V / __  / (_| | | | | (_| | |  __/ |
+     \/      \_/\_/\/ /_/ \__,_|_| |_|\__,_|_|\___|_|
+"""
+
+
+class FwHandlerError(ValueError):
+    """Raised when the input does not match the selected NAND layout."""
+
+
+@dataclass(frozen=True)
+class NandProfile:
+    """Physical geometry and factory bad-block information for one NAND part."""
+
+    name: str
+    page_data_size: int
+    oob_size: int
+    pages_per_block: int
+    blocks_per_plane: int
+    planes: int
+    bad_block_oob_offset: int
+    bad_block_marker: int
+    ecc_strength_bits: int
+    ecc_span_bytes: int
+
+    @property
+    def page_size(self):
+        return self.page_data_size + self.oob_size
+
+    @property
+    def blocks(self):
+        return self.blocks_per_plane * self.planes
+
+    @property
+    def pages(self):
+        return self.blocks * self.pages_per_block
+
+    @property
+    def raw_size(self):
+        return self.pages * self.page_size
+
+    @property
+    def data_size(self):
+        return self.pages * self.page_data_size
+
+
+class LogoArgumentParser(argparse.ArgumentParser):
+    """Argument parser that preserves the original help-screen logo."""
+
+    def print_help(self, file=None):
+        if file is None:
+            file = sys.stdout
+        print(LOGO, file=file)
+        super().print_help(file)
 
 
 def helpPrt(level=1):
-    print('''
-       ___                               _ _           
-      / __\_      __/\  /\__ _ _ __   __| | | ___ _ __ 
-     / _\ \ \ /\ / / /_/ / _` | '_ \ / _` | |/ _ \ '__|
-    / /    \ V  V / __  / (_| | | | | (_| | |  __/ |   
-    \/      \_/\_/\/ /_/ \__,_|_| |_|\__,_|_|\___|_|   
-    ''')
-    if (level == 1):
-        print('''
-    -h, --help          Print this information
-    -f, --file          Choose a binary file to handler
-    -e, --ecclen        Error correction code length, the unit is byte, and the 
-                        program will automatically eliminate ECC according to the 
-                        byte length of error correction code. You can refer to the 
-                        chip datasheet for the length of ECC, or you can manually 
-                        analyze the firmware. Cannot be 0 at the same time as ecclean
-    -s, --spare         A number, input the spare bytes. The spare field is generally 
-                        used for TLC and MLC. The spare field may not exist in SLC, 
-                        and only ecc will be used to ensure data correctness. Cannot be 0 
-                        at the same time as spare
-    -u, --unit          Cannot be 0. Storage unit, available storage stored in one page, 
-                        default is 2048 bytes
-    -p, --page          Number of pages stored in a block
-                        1 page = (unit + spare) bytes
-    -b, --block         Number of blocks stored in a plane. By default, bad blocks are 
-                        managed in blocks. 1 block = (unit + spare) bytes * page
-    -P, --plane         How many planes are there in the whole chip
-                        1 plane = (unit + spare) bytes * pages * blocks
-    --tmp               Save the cache file to facilitate the debugging personnel 
-                        to check whether the workflow is correct. Not enabled by default
-    --noskipbad         Whether the generated final file skips bad blocks. If this 
-                        option is enabled, bad blocks will not be skipped. Bad blocks
-                        are skipped by default. 
-                        The currently supported bad block management mechanism is to 
-                        skip bad blocks and place data in the next physically available 
-                        block.
+    """Compatibility help entry point from the original implementation."""
 
-    TIPS: For detailed format layout information, please refer to the relevant datasheet.
-
-Project contact: GitHub Issues
-Copyright 2022 @ FwHandler Contributors
-''')
-    exit(0)
+    if level == 1:
+        build_parser().print_help()
+    else:
+        print(LOGO)
+    raise SystemExit(0)
 
 
 def filePreCheck(binFile):
-    try:
-        fd = open(binFile, "rb")
-        fd.close()
-    except BaseException as e:
-        print("[!] Error Open %s, Please check the path or filename." % binFile)
-        exit(0)
+    """Compatibility input-file check."""
+
+    if not os.path.isfile(binFile):
+        print("[!] Error Open {}, Please check the path or filename.".format(binFile))
+        raise SystemExit(0)
+    return True
 
 
 def spareHexStatistic(prtStamp):
+    """Compatibility formatter for per-byte OOB statistics."""
+
     print("\nspare Hex value statistics (0xff):")
-    for i in range(0, (len(prtStamp) >> 4), 1):
-        for j in range(0, 0x10, 1):
-            print("0x%06x " % prtStamp[i*0x10 + j], end="")
-        print("")
+    for offset in range(0, len(prtStamp), 16):
+        row = prtStamp[offset : offset + 16]
+        print(" ".join("0x{:06x}".format(value) for value in row))
     print("\n")
-    pass
 
 
-def fileHandle(binFile, outputFile, ecclen=ecclen, spare=spare, unit=unit, page=page, block=block, plane=plane, noTmpFile=True, noSkipBad=True, isAllCombo=False):
-    totalAreas = plane * block * page
-    print("Ecclen = %d, Spare = %d, Unit = %d, Page = %d, Block = %d, Plane = %d" %
-          (ecclen, spare, unit, page, block, plane))
+MT29F8G08ABABA = NandProfile(
+    name="mt29f8g08ababa",
+    page_data_size=4096,
+    oob_size=224,
+    pages_per_block=128,
+    blocks_per_plane=1024,
+    planes=2,
+    bad_block_oob_offset=0,
+    bad_block_marker=0x00,
+    ecc_strength_bits=4,
+    ecc_span_bytes=540,
+)
 
-    print("binFile = %s" % binFile)
-    binFileSize = os.path.getsize(binFile)
-    print("Get File Size = %d bytes" % binFileSize)
-    if (binFileSize != totalAreas) and (ecclen != 0):
-        print("The preset size does not match the specified file size")
-    handleIndex = 0
-    timesIndex = 0
-    if (ecclen != 0) and (spare != 0):
-        tmpFile = binFile + ".fwtmp"
-    if (ecclen == 0) and (spare != 0):
-        tmpFile = outputFile
-    if (ecclen != 0) and (spare == 0):
-        tmpFile = binFile
-    if (spare != 0):
-        ffStamp = [0 for _ in range(spare+1)]
-        with open(file=binFile, mode="rb") as fd:
-            with open(file=tmpFile, mode="wb") as fdOutput:
-                index = 0
-                print("OutputFile: %s" % tmpFile)
-                while(fd.tell() < binFileSize):
-                    ub = fd.read(unit)      # unit binary
-                    sb = fd.read(spare)     # spare binary
-                    timesIndex = unit + spare
-                    handleIndex = handleIndex + timesIndex
-                    if (isAllCombo == False):
-                        sh0, sh1, sh2 = sb[0], sb[1], sb[2]
-                        if ((sh0, sh1) == (0xff, 0xff)):
-                            for i in range(0, spare, 1):
-                                if(sb[i] == 0xff):
-                                    ffStamp[i] = ffStamp[i] + 1
-                                    pass
-                        else:
-                            zeroStatic0 = 0
-                            for checkNoZero in ub:
-                                if (checkNoZero != 0):
-                                    break
-                                else:
-                                    zeroStatic0 = zeroStatic0 + 1
-                            zeroStatic1 = 0
-                            for checkNoZero in sb:
-                                if (checkNoZero != 0):
-                                    break
-                                else:
-                                    zeroStatic1 = zeroStatic1 + 1
-                            if (zeroStatic0 == int(unit)) and ((zeroStatic1 == int(spare))):
-                                print("[!] Bad page at offset 0x%x" % (
-                                    fd.tell() - int(unit) - int(spare)), end="")
-                                if (noSkipBad == True):
-                                    print("")
-                                    pass
-                                else:
-                                    print(", Skipped.")
-                                    continue
-                    index = index + 1
-                    fdOutput.write(ub)
-                    if(ecclen != 0):
-                        fdOutput.write(sb[2:34])
-                        pass
-                if (ecclen != 0):
-                    spareHexStatistic(ffStamp)
-                    if (ffStamp[0] != ffStamp[1]) or ((ffStamp[0] * (unit + spare)) != binFileSize):
-                        isAllCombo = False
-                        print("Exist bad block.")
-                    else:
-                        isAllCombo = True
-                        print("All Combo.")
-                    pass
-    if (ecclen != 0):
-        if (spare != 0):
-            unit = pow(2, ecclen+1)
-        fileHandle(binFile=tmpFile, outputFile=outputFile, ecclen=0, spare=ecclen, unit=unit,
-                   page=page, block=block, plane=plane, noTmpFile=noTmpFile, noSkipBad=noSkipBad, isAllCombo=isAllCombo)
-    print(noTmpFile)
-    if(noTmpFile == True):
+
+PROFILES = {
+    "mt29f8g08ababa": MT29F8G08ABABA,
+    "mt29f8g08ababawp": MT29F8G08ABABA,
+}
+
+
+def get_profile(name):
+    """Return a profile by normalized name."""
+
+    normalized = name.lower().replace("-", "").replace("_", "")
+    try:
+        return PROFILES[normalized]
+    except KeyError:
+        available = ", ".join(sorted(PROFILES))
+        raise FwHandlerError(
+            "Unknown profile '{}'. Available profiles: {}".format(name, available)
+        )
+
+
+def _profile_with_overrides(profile, args):
+    """Apply explicit geometry overrides without changing the base profile."""
+
+    overrides = {}
+    for argument, field in (
+        ("page_data_size", "page_data_size"),
+        ("oob_size", "oob_size"),
+        ("pages_per_block", "pages_per_block"),
+        ("blocks_per_plane", "blocks_per_plane"),
+        ("planes", "planes"),
+    ):
+        value = getattr(args, argument)
+        if value is not None:
+            overrides[field] = value
+
+    if not overrides:
+        return profile
+    return replace(profile, **overrides)
+
+
+def _read_exact(fd, size, description):
+    data = fd.read(size)
+    if len(data) != size:
+        raise FwHandlerError(
+            "Unexpected end of file while reading {}: expected {} bytes, got {}".format(
+                description, size, len(data)
+            )
+        )
+    return data
+
+
+def validate_profile_input(bin_file, profile):
+    """Validate a raw dump before writing any output bytes."""
+
+    if profile.page_data_size <= 0 or profile.oob_size <= 0:
+        raise FwHandlerError("Page data size and OOB size must be positive")
+    if profile.pages_per_block <= 0:
+        raise FwHandlerError("Pages per block must be positive")
+    if profile.blocks_per_plane <= 0 or profile.planes <= 0:
+        raise FwHandlerError("Block and plane counts must be positive")
+    if not 0 <= profile.bad_block_oob_offset < profile.oob_size:
+        raise FwHandlerError("Bad-block OOB offset is outside the OOB area")
+
+    file_size = os.path.getsize(bin_file)
+    if file_size == 0:
+        raise FwHandlerError("Input file is empty")
+    if file_size % profile.page_size != 0:
+        raise FwHandlerError(
+            "Input size {} is not a multiple of physical page size {} ({} + {}); "
+            "the file is not recognized as a {} raw dump".format(
+                file_size,
+                profile.page_size,
+                profile.page_data_size,
+                profile.oob_size,
+                profile.name,
+            )
+        )
+
+    page_count = file_size // profile.page_size
+    if page_count % profile.pages_per_block != 0:
+        raise FwHandlerError(
+            "Input contains {} pages, not a whole number of {}-page blocks; "
+            "block-aligned input is required when bad-block handling is enabled".format(
+                page_count, profile.pages_per_block
+            )
+        )
+    if page_count > profile.pages:
+        raise FwHandlerError(
+            "Input contains {} pages, exceeding the profile capacity of {} pages".format(
+                page_count, profile.pages
+            )
+        )
+
+    return file_size, page_count
+
+
+def process_profile(
+    bin_file,
+    output_file,
+    profile,
+    skip_bad=True,
+    keep_intermediate=False,
+):
+    """Extract main-area data from a block-aligned physical NAND dump."""
+
+    if os.path.abspath(bin_file) == os.path.abspath(output_file):
+        raise FwHandlerError("Input and output files must be different")
+
+    file_size, page_count = validate_profile_input(bin_file, profile)
+    block_count = page_count // profile.pages_per_block
+    intermediate_file = bin_file + ".fwtmp" if keep_intermediate else None
+    bad_blocks = []
+    pages_written = 0
+
+    with open(bin_file, "rb") as fd:
+        output_fd = open(output_file, "wb")
+        intermediate_fd = (
+            open(intermediate_file, "wb") if intermediate_file is not None else None
+        )
         try:
-            os.unlink(binFile + ".fwtmp")
-        except:
-            pass
-    pass
+            for block_index in range(block_count):
+                first_page_data = _read_exact(
+                    fd, profile.page_data_size, "block {} page 0 data".format(block_index)
+                )
+                first_page_oob = _read_exact(
+                    fd, profile.oob_size, "block {} page 0 OOB".format(block_index)
+                )
+                first_page = first_page_data + first_page_oob
+                is_bad = (
+                    first_page_oob[profile.bad_block_oob_offset]
+                    == profile.bad_block_marker
+                )
+                if is_bad:
+                    bad_blocks.append(block_index)
+
+                if not is_bad or not skip_bad:
+                    output_fd.write(first_page_data)
+                    pages_written += 1
+                    if intermediate_fd is not None:
+                        intermediate_fd.write(first_page)
+
+                for page_index in range(1, profile.pages_per_block):
+                    data = _read_exact(
+                        fd,
+                        profile.page_data_size,
+                        "block {} page {} data".format(block_index, page_index),
+                    )
+                    oob = _read_exact(
+                        fd,
+                        profile.oob_size,
+                        "block {} page {} OOB".format(block_index, page_index),
+                    )
+                    if not is_bad or not skip_bad:
+                        output_fd.write(data)
+                        pages_written += 1
+                        if intermediate_fd is not None:
+                            intermediate_fd.write(data + oob)
+        finally:
+            output_fd.close()
+            if intermediate_fd is not None:
+                intermediate_fd.close()
+
+    print("Profile = {}".format(profile.name))
+    print(
+        "Geometry = {} data + {} OOB bytes/page, {} pages/block, {} blocks/plane, {} planes".format(
+            profile.page_data_size,
+            profile.oob_size,
+            profile.pages_per_block,
+            profile.blocks_per_plane,
+            profile.planes,
+        )
+    )
+    print(
+        "ECC requirement = {}-bit per {} bytes; ECC byte layout is not inferred".format(
+            profile.ecc_strength_bits, profile.ecc_span_bytes
+        )
+    )
+    print("Input size = {} bytes ({} physical pages)".format(file_size, page_count))
+    print("OutputFile = {} ({} main-data pages)".format(output_file, pages_written))
+    if bad_blocks:
+        action = "skipped" if skip_bad else "retained"
+        print("Bad blocks = {} ({})".format(len(bad_blocks), action))
+        print("Bad block indexes = {}".format(", ".join(map(str, bad_blocks))))
+    else:
+        print("Bad blocks = 0")
+    if intermediate_file is not None:
+        print("IntermediateFile = {}".format(intermediate_file))
+
+    return {
+        "input_size": file_size,
+        "page_count": page_count,
+        "pages_written": pages_written,
+        "bad_blocks": bad_blocks,
+        "output_size": pages_written * profile.page_data_size,
+        "intermediate_file": intermediate_file,
+    }
+
+
+def _validate_legacy_capacity(page_count, pages_per_block, blocks_per_plane, planes):
+    """Validate legacy geometry only when all hierarchy values are supplied."""
+
+    values = (pages_per_block, blocks_per_plane, planes)
+    if any(value is not None for value in values) and not all(
+        value is not None for value in values
+    ):
+        raise FwHandlerError(
+            "Specify --page, --block, and --plane together for capacity validation"
+        )
+    if all(value is not None for value in values):
+        expected = pages_per_block * blocks_per_plane * planes
+        if page_count != expected:
+            raise FwHandlerError(
+                "Input contains {} legacy units, but the specified geometry requires {}".format(
+                    page_count, expected
+                )
+            )
+
+
+def process_legacy(
+    bin_file,
+    output_file,
+    ecclen,
+    spare,
+    unit,
+    pages_per_block=None,
+    blocks_per_plane=None,
+    planes=None,
+    skip_bad=True,
+    keep_intermediate=False,
+):
+    """Keep the original generic command-line path for existing examples.
+
+    With an OOB size, the legacy path writes only the main area because it
+    cannot safely infer a controller-specific ECC layout. Without OOB, it
+    supports the original interleaved ``unit + ecclen`` record format.
+    """
+
+    if os.path.abspath(bin_file) == os.path.abspath(output_file):
+        raise FwHandlerError("Input and output files must be different")
+
+    if unit <= 0:
+        raise FwHandlerError("--unit must be positive")
+    if spare < 0 or ecclen < 0:
+        raise FwHandlerError("--spare and --ecclen cannot be negative")
+    if spare == 0 and ecclen == 0:
+        raise FwHandlerError("--spare and --ecclen cannot both be zero")
+
+    if spare:
+        record_size = unit + spare
+        mode = "page + OOB"
+    else:
+        record_size = unit + ecclen
+        mode = "interleaved data + ECC"
+
+    file_size = os.path.getsize(bin_file)
+    if file_size == 0 or file_size % record_size != 0:
+        raise FwHandlerError(
+            "Input size {} is not a multiple of legacy record size {}".format(
+                file_size, record_size
+            )
+        )
+
+    record_count = file_size // record_size
+    _validate_legacy_capacity(
+        record_count, pages_per_block, blocks_per_plane, planes
+    )
+
+    intermediate_file = bin_file + ".fwtmp" if keep_intermediate else None
+    bad_blocks = []
+    bad_block_indexes = set()
+    records_written = 0
+
+    with open(bin_file, "rb") as fd:
+        output_fd = open(output_file, "wb")
+        intermediate_fd = (
+            open(intermediate_file, "wb") if intermediate_file is not None else None
+        )
+        try:
+            for record_index in range(record_count):
+                data = _read_exact(fd, unit, "legacy record {} data".format(record_index))
+                extra = _read_exact(
+                    fd,
+                    record_size - unit,
+                    "legacy record {} spare/ECC".format(record_index),
+                )
+                is_bad = False
+                if spare and pages_per_block:
+                    block_index = record_index // pages_per_block
+                    is_first_page = record_index % pages_per_block == 0
+                    if is_first_page and extra[0] == 0x00:
+                        bad_block_indexes.add(block_index)
+                        bad_blocks.append(block_index)
+                    is_bad = block_index in bad_block_indexes
+
+                if not is_bad or not skip_bad:
+                    output_fd.write(data)
+                    records_written += 1
+                    if intermediate_fd is not None:
+                        intermediate_fd.write(data + extra)
+        finally:
+            output_fd.close()
+            if intermediate_fd is not None:
+                intermediate_fd.close()
+
+    print("Legacy mode = {}".format(mode))
+    print("Input size = {} bytes ({} records)".format(file_size, record_count))
+    print("OutputFile = {} ({} data records)".format(output_file, records_written))
+    if bad_blocks:
+        action = "skipped" if skip_bad else "retained"
+        print("Bad blocks = {} ({})".format(len(bad_blocks), action))
+    if intermediate_file is not None:
+        print("IntermediateFile = {}".format(intermediate_file))
+
+    return {
+        "input_size": file_size,
+        "record_count": record_count,
+        "records_written": records_written,
+        "bad_blocks": bad_blocks,
+        "output_size": records_written * unit,
+        "intermediate_file": intermediate_file,
+    }
+
+
+def fileHandle(
+    binFile,
+    outputFile,
+    ecclen=0,
+    spare=0,
+    unit=2048,
+    page=0,
+    block=0,
+    plane=0,
+    noTmpFile=True,
+    noSkipBad=True,
+    isAllCombo=False,
+):
+    """Compatibility wrapper for the original ``fileHandle`` entry point.
+
+    ``page`` is interpreted as pages per block, matching the documented
+    command-line meaning. ``isAllCombo`` remains accepted for callers of the
+    old implementation but is no longer needed by the streaming parser.
+    """
+
+    del isAllCombo
+    return process_legacy(
+        bin_file=binFile,
+        output_file=outputFile,
+        ecclen=ecclen,
+        spare=spare,
+        unit=unit,
+        pages_per_block=page or None,
+        blocks_per_plane=block or None,
+        planes=plane or None,
+        skip_bad=not noSkipBad,
+        keep_intermediate=not noTmpFile,
+    )
+
+
+def build_parser():
+    parser = LogoArgumentParser(
+        description=(
+            "Extract main data from raw NAND dumps. Profile mode removes the "
+            "complete OOB area and does not perform ECC correction."
+        )
+    )
+    parser.add_argument("-f", "--file", required=True, help="Input binary dump")
+    parser.add_argument(
+        "-o", "--output", help="Output file; defaults to <input>.fwhd.bin"
+    )
+    parser.add_argument(
+        "--profile",
+        help="NAND profile, currently: mt29f8g08ababa",
+    )
+    parser.add_argument(
+        "-e",
+        "--ecclen",
+        type=int,
+        default=0,
+        help=(
+            "Legacy ECC byte count. With --profile this value is not used to "
+            "infer an ECC layout."
+        ),
+    )
+    parser.add_argument(
+        "-s",
+        "--spare",
+        dest="oob_size",
+        type=int,
+        default=None,
+        help="Legacy OOB/spare bytes per record",
+    )
+    parser.add_argument(
+        "-u",
+        "--unit",
+        dest="page_data_size",
+        type=int,
+        default=None,
+        help="Main data bytes per page/legacy record",
+    )
+    parser.add_argument(
+        "-p",
+        "--page",
+        "--pages-per-block",
+        dest="pages_per_block",
+        type=int,
+        default=None,
+        help="Pages/records per block",
+    )
+    parser.add_argument(
+        "-b",
+        "--block",
+        "--blocks-per-plane",
+        dest="blocks_per_plane",
+        type=int,
+        default=None,
+        help="Blocks per plane",
+    )
+    parser.add_argument(
+        "-P",
+        "--plane",
+        "--planes",
+        dest="planes",
+        type=int,
+        default=None,
+        help="Planes in the device",
+    )
+    parser.add_argument(
+        "--tmp",
+        action="store_true",
+        help="Keep retained physical records in <input>.fwtmp",
+    )
+    parser.add_argument(
+        "--noskipbad",
+        "--keep-bad-blocks",
+        dest="keep_bad_blocks",
+        action="store_true",
+        help="Retain data from blocks marked bad instead of skipping them",
+    )
+    return parser
+
+
+def parse_args(argv):
+    args = build_parser().parse_args(argv)
+    if not os.path.isfile(args.file):
+        raise FwHandlerError("Input file does not exist: {}".format(args.file))
+    if args.output is None:
+        args.output = args.file + ".fwhd.bin"
+    return args
 
 
 def parsePara(argv):
-    global spare, unit, page, block, plane, ecclen
+    """Compatibility parser returning the original three-value tuple."""
+
+    args = parse_args(argv)
+    return args.file, not args.tmp, args.keep_bad_blocks
+
+
+def main(argv=None):
     try:
-        options, args = getopt.getopt(argv, "hf:e:s:u:p:b:P:n", [
-                                      "help", "file=", "ecclen=", "spare=", "unit=", "page=", "block=", "plane=", "tmp", "noskipbad"])
-        # print("argc =", len(options))
-        # print(options)
-        if (len(options) == 0):
-            helpPrt()
-    except getopt.GetoptError:
-        print("FwHandler: getopt Fail.")
-    pass
-    try:
-        for option, value in options:
-            if option in ("-h", "--help"):
-                helpPrt()
-            if option in ("-f", "--file"):
-                binFile = format(value)
-                filePreCheck(binFile)
-                pass
-            if option in ("-s", "--spare"):
-                spare = int(format(value))
-                pass
-            if option in ("-u", "--unit"):
-                unit = int(format(value))
-                pass
-            if option in ("-p", "--page"):
-                page = int(format(value))
-                pass
-            if option in ("-b", "--block"):
-                block = int(format(value))
-                pass
-            if option in ("-P", "--plane"):
-                plane = int(format(value))
-                pass
-            if option in ("-e", "--ecclen"):
-                ecclen = int(format(value))
-                pass
-            if option in ("--tmp"):
-                noTmpFile = False
-                pass
-            else:
-                noTmpFile = True
-                pass
-            if option in ("--noskipbad"):
-                noSkipBad = True
-                pass
-            else:
-                noSkipBad = False
-                pass
-        page = unit + spare
-        if (unit == 0):
-            print("ERROR: Unit CAN NOT be zero. \nYou can enter the -h (--help) parameter to obtain instructions.\nAborted.")
-            exit(0)
-        if (spare == 0) and (ecclen == 0):
-            print("Spare and ecc cannot be 0 at the same time.\nFor detailed format layout information, please refer to the relevant datasheet.\nAborted.")
-            exit(0)
-        return binFile, noTmpFile, noSkipBad
-    except:
-        helpPrt(2)
+        args = parse_args(sys.argv[1:] if argv is None else argv)
+        if args.profile:
+            profile = _profile_with_overrides(get_profile(args.profile), args)
+            if args.ecclen:
+                print(
+                    "Warning: --ecclen is ignored in profile mode; the profile "
+                    "does not infer an ECC byte layout."
+                )
+            process_profile(
+                bin_file=args.file,
+                output_file=args.output,
+                profile=profile,
+                skip_bad=not args.keep_bad_blocks,
+                keep_intermediate=args.tmp,
+            )
+        else:
+            process_legacy(
+                bin_file=args.file,
+                output_file=args.output,
+                ecclen=args.ecclen,
+                spare=args.oob_size or 0,
+                unit=args.page_data_size or 2048,
+                pages_per_block=args.pages_per_block,
+                blocks_per_plane=args.blocks_per_plane,
+                planes=args.planes,
+                skip_bad=not args.keep_bad_blocks,
+                keep_intermediate=args.tmp,
+            )
+        return 0
+    except (FwHandlerError, OSError) as error:
+        print("[!] {}".format(error), file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
-    binFile, noTmpFile, noSkipBad = parsePara(sys.argv[1:])
-    fileHandle(binFile, outputFile=binFile+".fwhd.bin", ecclen=ecclen, spare=spare, unit=unit,
-               page=page, block=block, plane=plane, noTmpFile=noTmpFile, noSkipBad=noSkipBad, isAllCombo=False)
+    sys.exit(main())
