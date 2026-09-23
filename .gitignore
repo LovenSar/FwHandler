@@ -1,1 +1,27 @@
 __pycache__/
+*.pyc
+
+# ---------------------------------------------------------------------------
+# Real firmware dumps and anything derived from them must never be committed.
+# Firmware images may contain serial numbers, MAC addresses and cryptographic
+# keys. Keep them local to the machine that performed the recovery.
+# ---------------------------------------------------------------------------
+_real_dump/
+*.BIN
+*.BIN.zip
+*.bin.zip
+*.repaired.bin
+*.repaired.bin.extracted/
+*.fwhd.bin
+*.fwtmp
+*.repair.json
+
+# Scratch / throwaway working directories
+_scratch/
+_scrackh/
+
+# Local virtualenvs and editor state
+.venv/
+venv/
+.vscode/
+.idea/

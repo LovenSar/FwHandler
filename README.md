@@ -85,6 +85,13 @@ correction requires the programmer or controller's ECC algorithm, ECC step
 size, and ECC byte offsets. FwHandler currently refuses to infer those values
 from the generic `4-bit ECC` requirement.
 
+For a worked example where all of those values were recovered from a real dump
+of this chip — including an interleaved page layout that profile mode does not
+cover, a BCH16 parameter set, and a bit-reversal step the hardware applies —
+see [`examples/MT29F8G08ABABA/RECOVERY_NOTES.md`](examples/MT29F8G08ABABA/RECOVERY_NOTES.md).
+A self-contained reference implementation of that recovery is
+[`tools/unpack_mt29f8g08.py`](tools/unpack_mt29f8g08.py).
+
 ## Development and tests
 
 The code targets Python 3.8 or newer and uses only the standard library.
