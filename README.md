@@ -80,29 +80,37 @@ overwritten by page-size calculation.
 
 ## ECC boundary
 
-Removing OOB/ECC bytes is not the same as repairing ECC bit errors. Actual ECC
-correction requires the programmer or controller's ECC algorithm, ECC step
-size, and ECC byte offsets. FwHandler currently refuses to infer those values
-from the generic `4-bit ECC` requirement.
+Removing OOB/ECC bytes is not the same as repairing ECC bit errors. The generic
+profile does not infer a controller's ECC algorithm, step size, or byte offsets
+from the datasheet's `4-bit ECC` requirement.
 
-For a worked example where all of those values were recovered from a real dump
-of this chip — including an interleaved page layout that profile mode does not
-cover, a BCH16 parameter set, and a bit-reversal step the hardware applies —
-see [`examples/MT29F8G08ABABA/RECOVERY_NOTES.md`](examples/MT29F8G08ABABA/RECOVERY_NOTES.md).
-A self-contained reference implementation of that recovery is
-[`tools/unpack_mt29f8g08.py`](tools/unpack_mt29f8g08.py).
+The generic `Fwhandler.py` profile still removes the datasheet-defined OOB
+area and does not infer a controller-specific ECC layout. A separate reference
+script handles the recovered interleaved layout from one MT29F8G08ABABA dump.
+It applies BCH16 to all eight sectors per page, including the first sector's
+10-byte page header in that sector's BCH message. See
+[`examples/MT29F8G08ABABA/RECOVERY_NOTES.md`](examples/MT29F8G08ABABA/RECOVERY_NOTES.md)
+and [`tools/unpack_mt29f8g08.py`](tools/unpack_mt29f8g08.py).
 
-## Development and tests
+The prebuilt standalone package is
+[`dist/FwHandler-MT29F8G08ABABA-ECC16.zip`](dist/FwHandler-MT29F8G08ABABA-ECC16.zip).
+It contains the reference script and recovery notes, not the original dump or
+extracted firmware files.
 
-The code targets Python 3.8 or newer and uses only the standard library.
+## Development
 
-Run the regression tests from the workspace root:
+The code targets Python 3.8 or newer and uses only the standard library. This
+repository checkout does not currently include an automated test suite. A
+synthetic NAND fixture is provided under `examples/MT29F8G08ABABA` for checking
+the generic profile path.
+
+From the repository root, run:
 
 ```powershell
-python -m unittest discover -s .\FwHandler\tests -p "test_*.py" -v
+python .\Fwhandler.py --profile mt29f8g08ababa `
+  -f .\examples\MT29F8G08ABABA\MT29F8G08ABABA.synthetic.bin
 ```
 
-The tests cover page extraction, OOB removal, first-page-only bad-block
-checking, whole-block skipping, invalid input lengths, CLI geometry parsing,
-and the full-device geometry calculation. No full-size NAND image is created
-by the tests.
+The specialized BCH16 reference script accepts the full 1,132,462,080-byte
+controller-layout dump. The smaller synthetic fixture is only for the generic
+4,320-byte-page profile and cannot be used to validate that BCH16 decoder.

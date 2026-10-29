@@ -10,13 +10,12 @@
  Usage:
      python3 unpack_mt29f8g08.py <dump.bin> [-o OUTDIR] [--ecc] [--dir] [--all]
 
-     --ecc   Full-chip ECC verification and repair (slow but recovers bit-flips)
+     --ecc   Full-chip BCH16 verification and correction for all eight sectors
      --dir   Parse the filesystem directory and allocation tables
      --all   Scan the whole chip and extract every recognizable file
 
  Dependencies: Python standard library only.
-               The BCH16 encoder is implemented in pure Python; no external
-               packages such as bchlib are required.
+               BCH16 encoding and decoding are implemented in pure Python.
 
 ================================================================================
  1. PHYSICAL LAYOUT
@@ -35,12 +34,11 @@
 
      Offset        Length   Content
      0..9          10       Page header: [b0][FF][page_no][type][FF x6]
-                            page_no = (physical page - 1) & 0xFF
                             type    = 0x40 normal page / 0x48 block-first page
      10..4313      4304     8 x (512 data + 26 ECC)
                             block n: data = 10 + n*538 .. 10 + n*538 + 511
                                      ECC  = 10 + n*538 + 512 .. 10 + n*538 + 537
-     4314..4319    6        Zero padding
+     4314..4319    6        Trailing padding
 
  Logical data stream = 8 x 512 = 4,096 bytes per page
                      = 1,073,741,824 bytes total
@@ -90,42 +88,31 @@
 
  CRITICAL IMPLEMENTATION DETAIL:
 
-     Both the data and the ECC must be BIT-REVERSED PER BYTE before being fed
-     to a standard BCH encoder:
+     The message and ECC are BIT-REVERSED PER BYTE around the BCH encoder. For
+     sectors 1 through 7, the message is the 512-byte data sector. For sector 0,
+     it is the 10-byte page header followed by the 512-byte data sector:
 
-         ecc = bitrev8( bch_encode( bitrev8(data) ) )
+         ecc = bitrev8( bch_encode( bitrev8(message) ) )
 
-     Without this step, no combination of parameters reproduces the stored ECC.
-     This was the single blocking issue in the entire analysis.
+     The BCH16 decoder must locate up to 16 errors rather than try only
+     single-bit flips.
 
- Verification:
-     209 of 210 written blocks reproduce the stored ECC exactly. The one
-     mismatch is a known corrupted block, and single-bit search corrects it to
-     the expected value.
+ Full-chip BCH16 result for the supplied dump:
+     Corrected sectors : 9,018
+     Corrected bits    : 9,074
+     Unrepairable      :     0
 
- EXCEPTION - BLOCK 0:
-
-     The first 512-byte block of every page does NOT use BCH16. Its 26 trailing
-     bytes are metadata, not ECC: the controller mixes metadata into the ECC
-     computation (a common anti-page-swap measure). These bytes cannot be
-     verified or repaired with the recovered algorithm. They represent 12.5 % of
-     the data volume and are the root cause of all remaining unrecoverable files.
-
- Full-chip repair result:
-     Data-side single-bit corrections : 7,470
-     ECC-side single-bit corrections  :    24
-     Unrepairable blocks              :   380
-     Success rate                     : 95.2 %
-
-     Raw bit error rate is approximately 5.6e-5 per byte (1 in 18,000), which
-     indicates NAND aging or read disturb.
+     All eight sectors per page are covered. For sector 0, the 10-byte page
+     header is part of the BCH message. The decoder corrects up to 16 data or
+     ECC bit errors in a sector.
 
 ================================================================================
  4. FILESYSTEM STRUCTURE
 ================================================================================
  The filesystem is a proprietary log-structured format (magic "DL_FS4.00").
 
- Directory magic: "LDIR" / "LALC", found in 21 directory blocks.
+ Directory magic: "LDIR" / "LALC". The full run parsed 210 allocation tables
+ and 3,330 filenames across 20 directory blocks.
 
  DIRECTORY ENTRY (20-byte grid):
      [16-byte name fragment][u32]
@@ -145,16 +132,13 @@
 ================================================================================
  5. EXTRACTION RESULTS
 ================================================================================
-     Type      Extracted        Success rate
-     ELF       1,874 / 1,877    99.8 %
-     ZIP          27 / 27      100 %
-     gzip        234 / 237      98.7 %
-     PNG       1,483 / 1,573    94.3 %
-     XML              80        -
-     SQLite           15        -
-     locale          213        -
-
-     Total payload approximately 542 MB.
+     Type      Extracted        Detected starts
+     ELF       1,876            1,877
+     ZIP          27               27
+     gzip        223               227
+     PNG       1,544            1,573
+     XML           80               80
+     SQLite        15               15
 
 ================================================================================
 """
@@ -193,7 +177,7 @@ class BCH16:
     modulo the generator polynomial. The i.MX6 hardware additionally performs a
     per-byte bit reversal both before and after the BCH engine, so externally:
 
-        ecc = bitrev8( bch_encode( bitrev8(data) ) )
+        ecc = bitrev8( bch_encode( bitrev8(message) ) )
 
     The generator polynomial is g(x) = LCM(m1(x), m3(x), ..., m31(x)) with
     degree 208, where mi(x) is the minimal polynomial of alpha^i over GF(2).
@@ -209,6 +193,16 @@ class BCH16:
     def __init__(self):
         self._bitrev = bytes(int('{:08b}'.format(i)[::-1], 2) for i in range(256))
         self.gen = self._build_generator()
+        self._gf_exp = [0] * (2 * self.ORDER)
+        self._gf_log = [0] * (self.ORDER + 1)
+        value = 1
+        for i in range(self.ORDER):
+            self._gf_exp[i] = value
+            self._gf_log[value] = i
+            value = self._mul(value, 2)
+        if value != 1:
+            raise ValueError('primitive polynomial does not generate GF(2^13)')
+        self._gf_exp[self.ORDER:] = self._gf_exp[:self.ORDER]
 
     # ---- GF(2^13) arithmetic ----
     def _mul(self, a, b):
@@ -283,7 +277,7 @@ class BCH16:
 
     # ---- public interface ----
     def encode(self, data):
-        """512 bytes of data -> 26 bytes of ECC."""
+        """A sector message -> 26 bytes of BCH16 ECC."""
         d = self._brev(data)
         a = 0
         for byte in d:
@@ -296,32 +290,113 @@ class BCH16:
         """Return True if the ECC matches the data."""
         return self.encode(data) == ecc
 
-    def fix_single_bit(self, data, ecc, max_pos=None):
-        """
-        Single-bit correction: search for one flipped bit on the data side and
-        then on the ECC side such that the ECC matches.
+    def _gf_mul(self, a, b):
+        if not a or not b:
+            return 0
+        return self._gf_exp[self._gf_log[a] + self._gf_log[b]]
 
-        Returns (corrected_data, 'D'|'E', position, bit) or (None, None, -1, -1).
+    def _gf_div(self, a, b):
+        if not b:
+            raise ZeroDivisionError('division by zero in GF(2^13)')
+        if not a:
+            return 0
+        return self._gf_exp[(self._gf_log[a] - self._gf_log[b]) % self.ORDER]
+
+    def correct(self, data, ecc):
         """
-        if max_pos is None:
-            max_pos = len(data)
-        # data side
-        for pos in range(max_pos):
-            orig = data[pos]
-            for bit in range(8):
-                t = bytearray(data)
-                t[pos] = orig ^ (1 << bit)
-                if self.encode(bytes(t)) == ecc:
-                    return bytes(t), 'D', pos, bit
-        # ECC side
-        e = self.encode(data)
-        for pos in range(len(e)):
-            for bit in range(8):
-                t = bytearray(e)
-                t[pos] ^= (1 << bit)
-                if self._brev(bytes(t)) == ecc:
-                    return bytes(data), 'E', pos, bit
-        return None, None, -1, -1
+        Correct up to BCH16's 16-bit capacity in the data-plus-ECC codeword.
+
+        Returns (corrected_data, corrected_ecc, errors), where each error is
+        ('D'|'E', byte_position, bit_position). Returns None if decoding fails.
+        """
+        if len(ecc) != self.ECCBYTES:
+            return None
+        expected = self.encode(data)
+        if expected == ecc:
+            return bytes(data), bytes(ecc), []
+
+        # Stored ECC is bit-reversed per byte. Its difference from the
+        # calculated parity is the remainder of the complete error codeword.
+        delta = self._brev(bytes(a ^ b for a, b in zip(expected, ecc)))
+        remainder = int.from_bytes(delta, 'big')
+        syndromes = []
+        for root in range(1, 2 * self.T + 1):
+            syndrome = 0
+            bits = remainder
+            while bits:
+                low = bits & -bits
+                position = low.bit_length() - 1
+                syndrome ^= self._gf_exp[(position * root) % self.ORDER]
+                bits ^= low
+            syndromes.append(syndrome)
+        if not any(syndromes):
+            return None
+
+        # Berlekamp-Massey builds the error-locator polynomial.
+        count = 2 * self.T
+        locator = [0] * (count + 1)
+        previous = [0] * (count + 1)
+        locator[0] = previous[0] = 1
+        degree = 0
+        shift = 1
+        last_discrepancy = 1
+        for n in range(count):
+            discrepancy = syndromes[n]
+            for i in range(1, degree + 1):
+                discrepancy ^= self._gf_mul(locator[i], syndromes[n - i])
+            if discrepancy == 0:
+                shift += 1
+                continue
+            old_locator = locator[:]
+            scale = self._gf_div(discrepancy, last_discrepancy)
+            for i in range(count + 1 - shift):
+                if previous[i]:
+                    locator[i + shift] ^= self._gf_mul(scale, previous[i])
+            if 2 * degree <= n:
+                degree = n + 1 - degree
+                previous = old_locator
+                last_discrepancy = discrepancy
+                shift = 1
+            else:
+                shift += 1
+
+        if degree == 0 or degree > self.T:
+            return None
+
+        # Chien search locates errors across message metadata/data and ECC.
+        word_bits = 8 * len(data) + self.ECCBITS
+        positions = []
+        for position in range(word_bits):
+            x = self._gf_exp[(-position) % self.ORDER]
+            value = 0
+            for coefficient in reversed(locator[:degree + 1]):
+                value = self._gf_mul(value, x) ^ coefficient
+            if value == 0:
+                positions.append(position)
+        if len(positions) != degree:
+            return None
+
+        corrected_data = bytearray(data)
+        corrected_ecc = bytearray(ecc)
+        errors = []
+        for position in positions:
+            if position < self.ECCBITS:
+                byte_pos = self.ECCBYTES - 1 - position // 8
+                bit_pos = 7 - position % 8
+                corrected_ecc[byte_pos] ^= 1 << bit_pos
+                errors.append(('E', byte_pos, bit_pos))
+            else:
+                message_pos = position - self.ECCBITS
+                byte_pos = len(data) - 1 - message_pos // 8
+                bit_pos = 7 - message_pos % 8
+                corrected_data[byte_pos] ^= 1 << bit_pos
+                errors.append(('D', byte_pos, bit_pos))
+
+        corrected_data = bytes(corrected_data)
+        corrected_ecc = bytes(corrected_ecc)
+        if self.encode(corrected_data) != corrected_ecc:
+            return None
+        return corrected_data, corrected_ecc, errors
 
 
 # ============================================================================
@@ -336,6 +411,8 @@ class NandReader:
         self.npages = self.size // PAGE_RAW
         self.apply_fix = apply_fix
         self._hdr_cache = {}
+        self._data_fixes = {}
+        self._header_fixes = {}
 
     def raw_page(self, p):
         self.f.seek(p * PAGE_RAW)
@@ -344,7 +421,9 @@ class NandReader:
     def _page_header_byte(self, p):
         if p not in self._hdr_cache:
             self.f.seek(p * PAGE_RAW)
-            self._hdr_cache[p] = self.f.read(1)[0]
+            value = self.f.read(1)[0]
+            value ^= self._header_fixes.get(p, 0)
+            self._hdr_cache[p] = value
         return self._hdr_cache[p]
 
     def logic_page(self, p):
@@ -354,9 +433,37 @@ class NandReader:
         for n in range(8):
             base = DATA_OFF + n * BLK_STRIDE
             out += d[base:base + DATA_LEN]
+        for off, bit in self._data_fixes.get(p, ()):
+            if 0 <= off < len(out):
+                out[off] ^= 1 << bit
         if self.apply_fix and len(out) > FIX_OFFSET:
             out[FIX_OFFSET] = self._page_header_byte(p)
         return bytes(out)
+
+    def logic_prefix(self, p, length=16):
+        """Read the beginning of a logical page, applying ECC data fixes."""
+        d = self.raw_page(p)
+        out = bytearray(d[DATA_OFF:DATA_OFF + length])
+        for off, bit in self._data_fixes.get(p, ()):
+            if 0 <= off < len(out):
+                out[off] ^= 1 << bit
+        return bytes(out)
+
+    def set_ecc_fixes(self, fixes):
+        """Make decoded data and page-header corrections visible to readers."""
+        self._data_fixes = {}
+        self._header_fixes = {}
+        self._hdr_cache = {}
+        for p, blk, side, pos, bit in fixes:
+            if side != 'D':
+                continue
+            if blk == 0:
+                if pos == 0:
+                    self._header_fixes[p] = self._header_fixes.get(p, 0) ^ (1 << bit)
+                elif DATA_OFF <= pos < DATA_OFF + DATA_LEN:
+                    self._data_fixes.setdefault(p, []).append((pos - DATA_OFF, bit))
+            elif 1 <= blk < 8 and 0 <= pos < DATA_LEN:
+                self._data_fixes.setdefault(p, []).append((blk * DATA_LEN + pos, bit))
 
     # ---- read strategies ----
     def read_plain(self, start_page, length):
@@ -456,9 +563,9 @@ class Identifiers:
             return None
         do = zlib.decompressobj(31)
         try:
-            out = do.decompress(buf)
+            do.decompress(buf)
             if do.eof:
-                return out
+                return len(buf) - len(do.unused_data)
         except Exception:
             pass
         return None
@@ -488,28 +595,34 @@ class Identifiers:
 # ============================================================================
 def ecc_scan(reader, bch, fix=True, verbose=True):
     """
-    Scan the whole chip and verify every 512-byte block with BCH16.
-    Block 0 of each page is skipped: its 26 trailing bytes are metadata, not ECC.
+    Scan all eight 512-byte sectors of every page with BCH16.
+    The first sector's ECC covers the 10-byte page header and 512 data bytes.
 
-    Returns a list of (page, block, side, position, bit) records.
+    Returns one (page, block, side, position, bit) record per corrected bit,
+    plus one '?' record for each sector that could not be decoded.
     """
     fixes = []
     npages = reader.npages
     for p in range(npages):
         d = reader.raw_page(p)
-        for blk in range(1, 8):
+        for blk in range(8):
             base = DATA_OFF + blk * BLK_STRIDE
             data = d[base:base + DATA_LEN]
             ecc = d[base + DATA_LEN:base + DATA_LEN + ECC_LEN]
             if ecc == b'\xff' * ECC_LEN:
                 continue
-            if bch.check(data, ecc):
+            message = d[:DATA_OFF] + data if blk == 0 else data
+            if bch.check(message, ecc):
                 continue
             if not fix:
                 fixes.append((p, blk, '?', -1, -1))
                 continue
-            _, side, pos, bit = bch.fix_single_bit(data, ecc)
-            fixes.append((p, blk, side, pos, bit))
+            corrected = bch.correct(message, ecc)
+            if corrected is None:
+                fixes.append((p, blk, '?', -1, -1))
+                continue
+            for side, pos, bit in corrected[2]:
+                fixes.append((p, blk, side, pos, bit))
         if verbose and p and p % 20000 == 0:
             print('  ECC scan: %d/%d pages, %d records so far' % (p, npages, len(fixes)))
     return fixes
@@ -517,20 +630,13 @@ def ecc_scan(reader, bch, fix=True, verbose=True):
 
 def apply_ecc_fixes(reader, fixes, out_path):
     """Apply the repairs to the logical stream and write a clean data file."""
-    by_page = {}
-    for p, blk, side, pos, bit in fixes:
-        if side == 'D':
-            by_page.setdefault(p, []).append((blk, pos, bit))
-    n = 0
+    reader.set_ecc_fixes(fixes)
+    n = sum(1 for p, blk, side, pos, bit in fixes
+            if side == 'D' and
+            (blk > 0 or pos == 0 or DATA_OFF <= pos < DATA_OFF + DATA_LEN))
     with open(out_path, 'wb') as fo:
         for p in range(reader.npages):
-            buf = bytearray(reader.logic_page(p))
-            for blk, pos, bit in by_page.get(p, []):
-                off = blk * DATA_LEN + pos
-                if 0 <= off < PAGE_LOG:
-                    buf[off] ^= (1 << bit)
-                    n += 1
-            fo.write(bytes(buf))
+            fo.write(reader.logic_page(p))
     return n
 
 
@@ -647,9 +753,7 @@ def extract_all(reader, outdir, verbose=True):
     stats = {}
     fails = {}
     for p in range(reader.npages):
-        f = reader.f
-        f.seek(p * PAGE_RAW)
-        head = f.read(16)
+        head = reader.logic_prefix(p, 16)
         for name, sig, fn in SIGS:
             if not head.startswith(sig):
                 continue
@@ -670,9 +774,10 @@ def extract_all(reader, outdir, verbose=True):
         if head[:3] == b'\x1f\x8b\x08':
             got = None
             for rd in (reader.read_ring, reader.read_skipblk, reader.read_plain):
-                out = Identifiers.gzip(rd(p, 4 << 20))
-                if out is not None:
-                    got = out
+                buf = rd(p, 4 << 20)
+                n = Identifiers.gzip(buf)
+                if n is not None:
+                    got = buf[:n]
                     break
             if got is not None:
                 with open(os.path.join(outdir, 'gzip_%06d.gz' % p), 'wb') as fo:
@@ -694,11 +799,11 @@ def main():
     ap.add_argument('dump', help='NAND dump file (1,132,462,080 bytes)')
     ap.add_argument('-o', '--out', default='unpacked', help='output directory')
     ap.add_argument('--ecc', action='store_true',
-                    help='full-chip ECC verification and repair (slow)')
+                    help='full-chip BCH16 correction for all eight sectors')
     ap.add_argument('--dir', action='store_true',
                     help='parse the filesystem directory tables')
     ap.add_argument('--all', action='store_true',
-                    help='scan the whole chip and extract all files')
+                    help='scan the whole chip and extract validated supported files')
     ap.add_argument('--no-fix', action='store_true',
                     help='disable the offset-3904 correction (debug only)')
     args = ap.parse_args()
@@ -716,7 +821,9 @@ def main():
         size, size // PAGE_RAW, PAGE_RAW,
         size // (PAGE_RAW * BLK_PAGES), BLK_PAGES))
     if size != EXPECTED_DUMP_SIZE:
-        print(' warning: size differs from expected %d' % EXPECTED_DUMP_SIZE)
+        print('error: expected a %d-byte dump, got %d bytes' % (
+            EXPECTED_DUMP_SIZE, size))
+        return 1
 
     reader = NandReader(args.dump, apply_fix=not args.no_fix)
     os.makedirs(args.out, exist_ok=True)
@@ -727,11 +834,14 @@ def main():
         print('[1/4] Initialising ECC (BCH16, GF(2^13), primitive 0x201B) ...')
         bch = BCH16()
         print('      generator polynomial degree: %d' % (bch.gen.bit_length() - 1))
-        print('      scanning whole chip (block 0 skipped: metadata, not ECC) ...')
+        print('      scanning all 8 sectors per page ...')
         fixes = ecc_scan(reader, bch, fix=True)
-        nfix = sum(1 for x in fixes if x[2] in ('D', 'E'))
+        corrected_sectors = len(set((x[0], x[1]) for x in fixes if x[2] in ('D', 'E')))
+        corrected_bits = sum(1 for x in fixes if x[2] in ('D', 'E'))
         nbad = sum(1 for x in fixes if x[2] == '?')
-        print('      repaired %d, unrepairable %d' % (nfix, nbad))
+        print('      corrected sectors: %d' % corrected_sectors)
+        print('      corrected bits   : %d' % corrected_bits)
+        print('      unrepairable     : %d' % nbad)
         json.dump([[p, b, s, po, bi] for p, b, s, po, bi in fixes],
                   open(os.path.join(args.out, 'ecc_fixes.json'), 'w'))
         clean = os.path.join(args.out, 'data_clean.bin')
@@ -775,7 +885,8 @@ def main():
   Chip       : Micron MT29F8G08ABABA, 8 Gb SLC NAND
   Page       : 4,320 bytes = 10-byte header + 8 x (512 data + 26 ECC) + 6 pad
   ECC        : BCH16, GF(2^13), primitive 0x201B, 26 bytes per 512 bytes
-               data and ECC both bit-reversed per byte
+               sector 0 includes the 10-byte page header in its BCH message
+               message and ECC bytes are bit-reversed per byte
   Filesystem : proprietary log-structured format (magic "DL_FS4.00")
 
   See README.md for the full technical write-up.

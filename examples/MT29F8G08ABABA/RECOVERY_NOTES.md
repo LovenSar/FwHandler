@@ -19,13 +19,16 @@ so profile-mode OOB removal alone does not recover usable data.
 | ECC algorithm | BCH16, GF(2^13), primitive `0x201B` |
 | ECC size | 26 bytes per 512 bytes of data |
 | Critical detail | data and ECC both bit-reversed per byte |
-| Verify result | 209 / 210 written blocks exact match |
-| Full-chip repair | 7,494 / 7,874 bad blocks repaired (95.2 %) |
-| Raw bit error rate | ~5.6e-5 per byte (1 in 18,000) |
+| Full-chip scan | 2,097,152 sector positions across 262,144 pages |
+| Nonblank data sectors | 898,024 |
+| Blank sector positions | 1,199,128 |
+| Corrected sectors | 9,018 sectors, with 9,074 data or ECC bit errors corrected |
+| Unrepairable sectors | 0 |
 
-The single blocking issue in the whole recovery was the bit reversal. Without
-it, no combination of `m`, `t`, or primitive polynomial reproduces the stored
-ECC.
+The recovered layout requires per-byte bit reversal around the BCH engine,
+and the first sector on each page includes the 10-byte page header in its BCH
+message. The decoder must correct up to 16 bit errors rather than search only
+for single-bit flips.
 
 ---
 
@@ -82,23 +85,22 @@ This is the kind of detail that is invisible from the data sheet. If a
 candidate parameter set produces a valid-length ECC but never matches stored
 values, bit reversal is worth testing before discarding the parameter set.
 
-### Verification
+### First sector on each page
 
-Reproduce the stored ECC for 209 of 210 written blocks. The single mismatch is
-a corrupted block; single-bit search corrects it to the expected value.
+The first sector also uses BCH16. Its message is the 10-byte page header
+followed by the 512-byte sector data. The 26 bytes after that data are BCH
+parity, not an unverified metadata field. This was confirmed by reproducing
+the stored ECC with the header included and by scanning all eight sectors on
+every page.
 
-### Exception: the first block of every page
+### Full-chip verification
 
-The first 512-byte block of each page does **not** use BCH16. Its 26 trailing
-bytes are metadata, not ECC — the controller mixes metadata into the ECC
-computation (a common anti-page-swap measure).
-
-These bytes cannot be verified or repaired with the recovered algorithm. They
-are 12.5 % of the data volume and are the cause of every remaining
-unrecoverable file. Attempting to BCH-verify this block yields a ~100 % failure
-rate that can easily be mistaken for a wrong parameter set; if one block
-position out of eight always fails while the other seven pass, suspect
-metadata-mixed ECC rather than a bad guess.
+The supplied dump contains 2,097,152 sector positions. The scan classifies
+1,199,128 positions as blank and 898,024 as data sectors. Of the data sectors,
+889,006 already matched their ECC and 9,018 were corrected. The decoder
+reported zero unrepairable sectors. This describes the BCH16 scan result and
+does not by itself guarantee that every extracted file passes its own format
+validation.
 
 ---
 
@@ -149,7 +151,8 @@ outside the read window.
 
 Proprietary log-structured format, magic `DL_FS4.00`.
 
-Directory magic: `LDIR` / `LALC`, found in 21 directory blocks.
+Directory magic: `LDIR` / `LALC`. The full run parsed 210 allocation tables
+and 3,330 filenames across 20 directory blocks.
 
 **Directory entry** (20-byte grid):
 
@@ -192,17 +195,17 @@ Ordered by how much time each step saved.
    every page has the same value at the same offset, that offset is not data.
    Look for where the real value is stored elsewhere.
 
-5. **Check whether ECC verification fails uniformly or only in one block
-   position.** Uniform failure suggests wrong parameters; a single failing
-   position suggests a special block (metadata, bad-block marker, spare).
+5. **Check the complete ECC message, including metadata inputs.** A sector may
+   include page-header bytes in the BCH message. Do not assume its parity bytes
+   are metadata just because the other sectors verify without those header bytes.
 
 6. **Test bit reversal early.** If a parameter set gives the right ECC length
    but never matches, try reversing bits within bytes on both input and output
    before abandoning the parameters.
 
-7. **Bit error rate tells you what else to check.** A rate far above what a
-   healthy chip shows (roughly 1e-6 or better) points to aging or read disturb
-   and means ECC repair is mandatory, not optional.
+7. **Estimate bit error rate only after scanning every programmed sector.**
+   Leaving a sector position out of the scan can distort the estimate and the
+   number of reported unrepairable sectors.
 
 8. **Files with self-validation (PNG, ZIP, gzip) are the best ground truth.**
    They let you confirm a read strategy is correct without needing a reference
@@ -228,4 +231,18 @@ To handle dumps of this shape, a profile would need:
 
 A worked reference implementation is available as `unpack_mt29f8g08.py`; it is
 self-contained (standard library only, pure-Python BCH16) and documents the
-same layout described above.
+same layout described above. It corrects up to 16 data or ECC bit errors per
+sector and includes the page header in the first sector's BCH message.
+
+## 8. Extraction results and limits
+
+The full run extracted 1,876 ELF files, 27 ZIP files, 223 gzip files, 1,544
+PNG files, 80 XML files, and 15 SQLite databases. All 223 extracted gzip files
+passed decompression checks. A further 29 PNG starts, one ELF start, and four
+gzip starts did not pass complete-file validation. These file-level results
+are separate from the ECC scan's zero unrepairable sectors.
+
+The allocation-table entry count matches the directory's file count, but the
+ordering could not be aligned. Files are therefore recovered by signature
+scanning rather than by directory lookup. No U-Boot or SPL image was found in
+this dump; it may be stored on a separate medium.
